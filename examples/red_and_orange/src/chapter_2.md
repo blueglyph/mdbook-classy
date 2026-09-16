@@ -233,3 +233,21 @@ Example:
 This makes the level 1 heading with the content `Example heading`, ID `first`, and classes `class1` and `class2`. Note that the attributes should be space-separated.
 
 More information can be found in the [heading attrs spec page](https://github.com/raphlinus/pulldown-cmark/blob/master/pulldown-cmark/specs/heading_attrs.txt).
+
+### Definition Lists
+
+term A
+  : This is a definition of term A. Text
+    can span multiple lines.
+
+term B
+  : This is a definition of term B.
+  : This has more than one definition.
+
+### Admonitions
+
+> [!NOTE]
+> This is checking a few admonitions
+
+> [!WARNING]
+> Don't forget to validate this document by visual inspection!
