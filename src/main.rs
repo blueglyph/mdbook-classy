@@ -1,10 +1,13 @@
+mod tests;
+
 use clap::{arg, command, ArgMatches, Command};
-use mdbook::book::{Book, Chapter};
-use mdbook::errors::Error;
-use mdbook::preprocess::{CmdPreprocessor, Preprocessor, PreprocessorContext};
-use mdbook::utils::new_cmark_parser;
-use pulldown_cmark::{CowStr, Event, Tag};
+use mdbook_core::book::{Book, Chapter};
+use mdbook_core::errors::{Error, Result};
+use mdbook_preprocessor::{Preprocessor, PreprocessorContext};
+use mdbook_markdown::{new_cmark_parser, MarkdownOptions};
+use pulldown_cmark::{CowStr, Event, Tag, TagEnd};
 use std::io;
+use std::io::Read;
 use std::process;
 
 #[derive(Default)]
@@ -21,8 +24,8 @@ impl Preprocessor for Classy {
         "classy"
     }
     fn run(&self, _ctx: &PreprocessorContext, mut book: Book) -> Result<Book, Error> {
-        book.for_each_mut(|book| {
-            if let mdbook::BookItem::Chapter(chapter) = book {
+        book.for_each_mut(|book_item| {
+            if let mdbook_core::book::BookItem::Chapter(chapter) = book_item {
                 if let Err(e) = classy(chapter) {
                     eprintln!("classy error: {:?}", e);
                 }
@@ -30,8 +33,8 @@ impl Preprocessor for Classy {
         });
         Ok(book)
     }
-    fn supports_renderer(&self, renderer: &str) -> bool {
-        renderer == "html"
+    fn supports_renderer(&self, renderer: &str) -> Result<bool> {
+        Ok(renderer == "html")
     }
 }
 
@@ -47,12 +50,14 @@ enum State<'a> {
 /// Take paragraphs beginning with `{:.class-name}` and give them special rendering.
 /// Mutation: the payload here is that it edits chapter.content.
 fn classy(chapter: &mut Chapter) -> Result<(), Error> {
-    let parser = new_cmark_parser(&chapter.content, false);
+    const VERBOSE: bool = false;
+    let parser = new_cmark_parser(&chapter.content, &MarkdownOptions::default());
 
     let mut state = State::BeforeStart;
     let mut new_events = vec![];
 
     for event in parser {
+        if VERBOSE { eprintln!("## event {event:?}, state {state:?}"); }
         if let State::Accepted(text) = state {
             if matches!(event, Event::SoftBreak | Event::HardBreak) {
                 state = State::Inner;
@@ -66,7 +71,6 @@ fn classy(chapter: &mut Chapter) -> Result<(), Error> {
             }
             continue;
         }
-
         match event {
             Event::Start(Tag::Paragraph) => {
                 state = State::Expecting;
@@ -77,8 +81,9 @@ fn classy(chapter: &mut Chapter) -> Result<(), Error> {
                 // event sequence: Start(Paragraph) -> Text(Borrowed(_)) -> SoftBreak | HardBreak
                 if text.len() > "{:.}".len() && text.starts_with("{:.") && text.ends_with('}') {
                     state = State::Accepted(text);
-                    new_events.push(Event::Html(
-                        format!("<div class=\"{}\">\n", &text[3..text.len() - 1]).into(),
+                    if VERBOSE { eprintln!("  ==> <div>, state {state:?}"); }
+                    new_events.push(Event::InlineHtml(
+                        format!("<div class=\"{}\">\n\n", &text[3..text.len() - 1]).into(),
                     ));
                 } else {
                     state = State::BeforeStart;
@@ -87,13 +92,13 @@ fn classy(chapter: &mut Chapter) -> Result<(), Error> {
                 }
             }
 
-            Event::End(Tag::Paragraph) => {
+            Event::End(TagEnd::Paragraph) => {
                 if matches!(state, State::Expecting) {
                     new_events.push(Event::Start(Tag::Paragraph));
                 }
-                new_events.push(Event::End(Tag::Paragraph));
+                new_events.push(Event::End(TagEnd::Paragraph));
                 if matches!(state, State::Inner) {
-                    new_events.push(Event::Html("</div>\n".into()));
+                    new_events.push(Event::InlineHtml("\n</div>\n\n".into()));
                 }
                 state = State::BeforeStart;
             }
@@ -107,43 +112,47 @@ fn classy(chapter: &mut Chapter) -> Result<(), Error> {
             }
         }
     }
-
+    if VERBOSE { eprintln!("new_events:\n{}", new_events.iter().map(|e| format!("####> {e:?}")).collect::<Vec<_>>().join("\n")); }
     let mut buf = String::with_capacity(chapter.content.capacity());
     pulldown_cmark_to_cmark::cmark(new_events.into_iter(), &mut buf).expect("can re-render cmark");
     chapter.content = buf;
     Ok(())
 }
 
-/// Housekeeping:
-/// 1. Check compatibility between preprocessor and mdbook
-/// 2. deserialize, run the transformation, and reserialize.
-fn handle_preprocessing(pre: &dyn Preprocessor) -> Result<(), Error> {
-    let (ctx, book) = CmdPreprocessor::parse_input(io::stdin())?;
+fn book_preprocessing<R: Read>(pre: &Classy, input: R) -> Result<Book, Error> {
+    let (ctx, book) = mdbook_preprocessor::parse_input(input)?;
 
-    if ctx.mdbook_version != mdbook::MDBOOK_VERSION {
+    if ctx.mdbook_version != mdbook_core::MDBOOK_VERSION {
         // We should probably use the `semver` crate to check compatibility
         // here...
         eprintln!(
             "Warning: The {} plugin was built against version {} of mdbook, \
              but we're being called from version {}",
             pre.name(),
-            mdbook::MDBOOK_VERSION,
+            mdbook_core::MDBOOK_VERSION,
             ctx.mdbook_version
         );
     }
+    pre.run(&ctx, book)
+}
 
-    let processed_book = pre.run(&ctx, book)?;
+/// Housekeeping:
+/// 1. Check compatibility between preprocessor and mdbook
+/// 2. deserialize, run the transformation, and reserialize.
+fn handle_io_preprocessing(pre: &Classy) -> Result<(), Error> {
+    let processed_book = book_preprocessing(pre, io::stdin())?;
     serde_json::to_writer(io::stdout(), &processed_book)?;
 
     Ok(())
 }
 
-/// Check to see if we support the processor (classy only supports html right now)
-fn handle_supports(pre: &dyn Preprocessor, sub_args: &ArgMatches) -> ! {
+/// Check to see if we support the processor (classy only supports HTML right now)
+fn handle_supports(pre: &Classy, sub_args: &ArgMatches) -> ! {
     let renderer = sub_args
         .get_one::<String>("renderer")
         .expect("Required argument");
-    let supported = pre.supports_renderer(renderer);
+    let supported = pre.supports_renderer(renderer)
+        .unwrap_or_else(|e| panic!("Couldn't check if renderer supported: {e}"));
 
     if supported {
         process::exit(0);
@@ -168,7 +177,7 @@ fn main() {
     if let Some(sub_args) = matches.subcommand_matches("supports") {
         handle_supports(&preprocessor, sub_args);
     }
-    if let Err(e) = handle_preprocessing(&preprocessor) {
+    if let Err(e) = handle_io_preprocessing(&preprocessor) {
         eprintln!("{}", e);
         process::exit(1);
     }
